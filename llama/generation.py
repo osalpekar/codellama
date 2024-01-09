@@ -69,6 +69,7 @@ class Llama:
         tokenizer_path: str,
         max_seq_len: int,
         max_batch_size: int,
+        use_kv_cache: bool = True,
         model_parallel_size: Optional[int] = None,
     ) -> "Llama":
         if not torch.distributed.is_initialized():
@@ -84,6 +85,7 @@ class Llama:
         local_rank = int(os.environ.get("LOCAL_RANK", 0))
         if device == "cuda":
             torch.cuda.set_device(local_rank)
+
 
         # seed must be the same in all processes
         torch.manual_seed(1)
@@ -105,6 +107,7 @@ class Llama:
         model_args: ModelArgs = ModelArgs(
             max_seq_len=max_seq_len,
             max_batch_size=max_batch_size,
+            use_kv_cache=use_kv_cache,
             **params,
         )
         tokenizer = Tokenizer(model_path=tokenizer_path)
@@ -121,6 +124,7 @@ class Llama:
         model.load_state_dict(checkpoint, strict=False)
         model.to(device)
         print(f"Loaded in {time.time() - start_time:.2f} seconds")
+        torch.set_default_device("cpu")
 
         return Llama(model, tokenizer)
 
@@ -138,6 +142,7 @@ class Llama:
         logprobs: bool = False,
         echo: bool = False,
         stop_token: Optional[int] = None,
+        output_hidden_states: bool = False,
     ) -> Tuple[List[List[int]], Optional[List[List[float]]]]:
         if stop_token is None:
             stop_token = self.tokenizer.eos_id
@@ -161,7 +166,7 @@ class Llama:
         stop_reached = torch.tensor([False] * bsz, device=device)
         input_text_mask = tokens != pad_id
         for cur_pos in range(min_prompt_len, total_len):
-            logits = self.model.forward(tokens[:, prev_pos:cur_pos], prev_pos)
+            logits, hidden_states = self.model.forward(tokens[:, prev_pos:cur_pos], prev_pos, output_hidden_states)
             if logprobs:
                 token_logprobs[:, prev_pos + 1 : cur_pos + 1] = -F.cross_entropy(
                     input=logits.transpose(1, 2),
@@ -203,7 +208,11 @@ class Llama:
                 probs = probs[:stop_idx] if logprobs else None
             out_tokens.append(toks)
             out_logprobs.append(probs)
-        return (out_tokens, out_logprobs if logprobs else None)
+        return (
+            out_tokens,
+            out_logprobs if logprobs else None,
+            hidden_states if output_hidden_states else None
+        )
 
     def text_completion(
         self,
@@ -217,7 +226,7 @@ class Llama:
         if max_gen_len is None:
             max_gen_len = self.model.params.max_seq_len - 1
         prompt_tokens = [self.tokenizer.encode(x, bos=True, eos=False) for x in prompts]
-        generation_tokens, generation_logprobs = self.generate(
+        generation_tokens, generation_logprobs, hidden_states = self.generate(
             prompt_tokens=prompt_tokens,
             max_gen_len=max_gen_len,
             temperature=temperature,
@@ -255,7 +264,7 @@ class Llama:
             )
             for prefix, suffix in zip(prefixes, suffixes)
         ]
-        generation_tokens, generation_logprobs = self.generate(
+        generation_tokens, generation_logprobs, hidden_states = self.generate(
             prompt_tokens=prompt_tokens,
             max_gen_len=max_gen_len,
             temperature=temperature,
@@ -348,7 +357,7 @@ class Llama:
             )
             prompt_tokens.append(dialog_tokens)
 
-        generation_tokens, generation_logprobs = self.generate(
+        generation_tokens, generation_logprobs, hidden_states = self.generate(
             prompt_tokens=prompt_tokens,
             max_gen_len=max_gen_len,
             temperature=temperature,
